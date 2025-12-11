@@ -1,0 +1,993 @@
+---
+title: "final_project"
+author: "He Jiang"
+format: pdf
+editor: visual
+---
+
+```{python}
+
+import pandas as pd
+import numpy as np
+from pathlib import Path
+
+DATA_PATH = Path("data/loan_data.csv")
+assert DATA_PATH.exists(), f"File not found: {DATA_PATH}"
+
+OUT_DIR   = Path("outputs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+df = pd.read_csv(DATA_PATH, dtype={"loanId": "string"}, low_memory=False)
+
+print("Shape:", df.shape)
+print("Columns:", list(df.columns)[:40])
+
+rename_map = {
+    "loanId": "loan_id",
+    "clientIncome": "income",
+    "incomeVerified": "income_verified",
+    "clientAge": "age",
+    "clientGender": "gender",
+    "clientMaritalStatus": "marital_status",
+    "clientLoanPurpose": "loan_purpose",
+    "clientResidentialStatus": "residence_status",
+    "clientTimeAtEmployer": "tenure_months",
+    "clientNumberPhoneContacts": "phone_contacts",
+    "clientAvgCallsPerDay": "avg_calls_per_day",
+    "loanNumber": "loan_sequence",
+    "loanAmount": "amount",
+    "interestRate": "interest_rate",
+    "loanTerm": "term_months",
+    "maxAmountTaken": "max_amount_taken",
+    "maxTenorTaken": "max_term_taken",
+    "settleDays": "settle_days",
+    "paymentRatio": "payment_ratio",
+    "firstPaymentDefault": "first_payment_default",
+    "loanDefault": "default_flag",
+    "loanIncomeRatio": "loan_income_ratio",
+    "applicationDateMonth": "application_month",
+    "approvalDateMonth": "approval_month",
+    "disbursementDateMonth": "disbursement_month",
+    "repaidDateMonth": "repaid_month",
+    "FirstPaymentDueDateMonth": "first_due_month",
+    "dueDateMonth": "due_month",
+}
+
+
+missing = [c for c in rename_map if c not in df.columns]
+if missing:
+    raise ValueError(f"Missing expected input columns: {missing}")
+
+df = df_raw.rename(columns=rename_map)
+df.head()
+
+keep_cols = [
+    "loan_id",
+    "amount", "interest_rate", "term_months",
+    "income", "income_verified",
+    "age",
+    "loan_sequence",
+    "max_amount_taken",
+    "payment_ratio", "loan_income_ratio",
+    "first_payment_default",
+    "settle_days",
+    "gender", "loan_purpose", "residence_status",
+    "default_flag",
+]
+df = df[keep_cols].copy()
+
+df.to_csv(OUT_DIR / "loan_data_clean_selected.csv", index=False)
+```
+
+```{r}
+# ===============================================================
+# AFFORDABILITY, DEFAULT, AND REPAYMENT TIMING IN CONSUMER LOANS
+# Figures 1–7 for Final Report
+# ===============================================================
+
+# 0. SETUP -------------------------------------------------------
+library(tidyverse)
+library(broom)
+library(car)          # VIF calculations
+library(pROC)         # ROC / AUC
+library(scales)       # Formatting percentages
+library(knitr)        # kable for tables
+library(gridExtra)    # Arrange multiple plots
+library(ggplot2)
+
+# Set consistent theme for all plots
+theme_set(theme_minimal(base_size = 11))
+
+# 1. READ AND PREPARE DATA ---------------------------------------
+# Adjust the path if your CSV is elsewhere
+loan <- read_csv("data/loan_preprocessed_for_R.csv")
+
+loan_clean <- loan %>%
+  mutate(
+    default_flag = as.integer(default_flag),
+    lti         = loan_income_ratio,
+    pti         = payment_ratio,
+    income_k    = income / 1000,
+    amount_k    = amount / 1000
+  ) %>%
+  drop_na(
+    default_flag, lti, pti, income_k, amount_k,
+    term_months, interest_rate, settle_days
+  )
+
+cat("Total observations after cleaning:", nrow(loan_clean), "\n")
+cat("Default rate:", percent(mean(loan_clean$default_flag), accuracy = 0.1), "\n")
+
+
+# ===============================================================
+# RESEARCH QUESTION 1: DEFAULT ANALYSIS
+# ===============================================================
+cat("\n=== RESEARCH QUESTION 1: DEFAULT ANALYSIS ===\n")
+
+set.seed(12345)
+
+# 1.1 Balanced sample --------------------------------------------
+loan_default    <- loan_clean %>% filter(default_flag == 1)
+loan_nondefault <- loan_clean %>% filter(default_flag == 0)
+n_default       <- nrow(loan_default)
+
+loan_nondefault_sample <- loan_nondefault %>%
+  slice_sample(n = n_default)
+
+loan_balanced <- bind_rows(loan_default, loan_nondefault_sample) %>%
+  mutate(
+    lti_quintile = ntile(lti, 5),
+    lti_quintile_f = factor(
+      lti_quintile,
+      levels = 1:5,
+      labels = c("Q1 (Lowest)", "Q2", "Q3", "Q4", "Q5 (Highest)")
+    )
+  )
+
+cat("Balanced sample size:", nrow(loan_balanced), "\n")
+cat("Balanced default rate:", percent(mean(loan_balanced$default_flag)), "\n\n")
+
+
+# 1.2 Figure 1: Default rate by LTI quintile ---------------------
+default_by_lti <- loan_balanced %>%
+  group_by(lti_quintile_f) %>%
+  summarise(
+    n            = n(),
+    defaults     = sum(default_flag),
+    default_rate = mean(default_flag),
+    .groups      = "drop"
+  )
+
+fig1 <- ggplot(default_by_lti,
+               aes(x = lti_quintile_f, y = default_rate)) +
+  geom_col(width = 0.7, alpha = 0.8) +
+  geom_text(aes(label = percent(default_rate, accuracy = 0.1)),
+            vjust = -0.5, size = 3.5, fontface = "bold") +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, max(default_by_lti$default_rate) * 1.15),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Loan-to-Income Ratio Quintile",
+    y = "Default Rate"
+  ) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    axis.text          = element_text(color = "black"),
+    axis.title         = element_text(face = "bold")
+  )
+
+ggsave("figure1_default_by_lti.png", fig1,
+       width = 6, height = 4, dpi = 300)
+cat("Figure 1 saved: figure1_default_by_lti.png\n")
+
+
+# 1.3 Logistic regression models ---------------------------------
+# Main effects model
+model_default_main <- glm(
+  default_flag ~ lti + income_k + amount_k + term_months + interest_rate,
+  data   = loan_balanced,
+  family = binomial(link = "logit")
+)
+
+# Interaction model: LTI × income
+model_default_interact <- glm(
+  default_flag ~ lti * income_k + amount_k + term_months + interest_rate,
+  data   = loan_balanced,
+  family = binomial(link = "logit")
+)
+
+lr_test <- anova(model_default_main, model_default_interact, test = "Chisq")
+cat("\n=== MODEL COMPARISON (Default) ===\n")
+print(lr_test)
+
+model_default_final <- model_default_interact
+
+
+# 1.4 ROC Curve and Figure 2 -------------------------------------
+roc_default <- roc(
+  response  = loan_balanced$default_flag,
+  predictor = fitted(model_default_final),
+  direction = "<"
+)
+
+auc_value <- auc(roc_default)
+cat("\nArea Under ROC Curve (AUC):", round(auc_value, 4), "\n")
+
+png("figure2_roc_curve.png",
+    width = 6, height = 6, units = "in", res = 300)
+plot(roc_default,
+     lwd          = 2,
+     main         = "ROC Curve for Default Prediction Model",
+     print.auc    = TRUE,
+     print.auc.x  = 0.4,
+     print.auc.y  = 0.1,
+     legacy.axes  = TRUE)
+abline(a = 0, b = 1, lty = 2)
+dev.off()
+cat("Figure 2 saved: figure2_roc_curve.png\n")
+
+
+# 1.5 Confusion matrix for reference (optional) ------------------
+coords_roc <- coords(roc_default, "best", best.method = "youden")
+optimal_threshold <- coords_ro$threshold
+cat("Optimal threshold (Youden):", optimal_threshold, "\n")
+
+loan_balanced <- loan_balanced %>%
+  mutate(
+    pred_prob  = fitted(model_default_final),
+    pred_class = ifelse(pred_prob > optimal_threshold, 1, 0)
+  )
+
+conf_matrix <- table(
+  Predicted = loan_balanced$pred_class,
+  Actual    = loan_balanced$default_flag
+)
+
+cat("\nConfusion Matrix (balanced sample):\n")
+print(conf_matrix)
+
+
+# 1.6 Figure 3: Predicted default prob vs LTI by income levels ---
+median_vals <- loan_balanced %>%
+  summarise(
+    amount_k     = median(amount_k),
+    term_months  = median(term_months),
+    interest_rate = median(interest_rate)
+  )
+
+# Choose representative income levels from distribution
+income_levels <- quantile(loan_balanced$income_k,
+                          probs = c(0.25, 0.50, 0.75), na.rm = TRUE)
+
+newdata_lti <- expand_grid(
+  lti      = seq(min(loan_balanced$lti, na.rm = TRUE),
+                 max(loan_balanced$lti, na.rm = TRUE),
+                 length.out = 100),
+  income_k = as.numeric(income_levels)
+) %>%
+  crossing(median_vals) %>%
+  mutate(
+    pred_prob = predict(model_default_final, newdata = ., type = "response"),
+    income_level = factor(
+      income_k,
+      levels = as.numeric(income_levels),
+      labels = c("Low income (25th pct)",
+                 "Median income (50th pct)",
+                 "High income (75th pct)")
+    )
+  )
+
+fig3 <- ggplot(newdata_lti,
+               aes(x = lti, y = pred_prob, color = income_level)) +
+  geom_line(size = 1.1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  labs(
+    x     = "Loan-to-Income Ratio",
+    y     = "Predicted Default Probability",
+    color = "Income level"
+  ) +
+  theme(
+    legend.position = "bottom",
+    legend.title    = element_text(face = "bold"),
+    axis.text       = element_text(color = "black"),
+    axis.title      = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+ggsave("figure3_interaction_effect.png", fig3,
+       width = 7, height = 5, dpi = 300)
+cat("Figure 3 saved: figure3_interaction_effect.png\n")
+
+
+# ===============================================================
+# RESEARCH QUESTION 2: SETTLEMENT TIMING ANALYSIS
+# ===============================================================
+cat("\n=== RESEARCH QUESTION 2: SETTLEMENT TIMING ===\n")
+
+# 2.1 Prepare non-defaulted loans --------------------------------
+loan_settled <- loan_clean %>%
+  filter(default_flag == 0) %>%
+  drop_na(
+    settle_days, lti, pti, income_k,
+    amount_k, term_months, interest_rate, loan_sequence
+  )
+
+cat("Number of non-defaulted loans:", nrow(loan_settled), "\n")
+cat("Median settlement timing:", median(loan_settled$settle_days), "days\n")
+cat("Mean settlement timing:", round(mean(loan_settled$settle_days), 2), "days\n")
+cat("SD settlement timing:", round(sd(loan_settled$settle_days), 2), "days\n\n")
+
+
+# 2.2 Figure 4: Distribution of settlement timing ----------------
+fig4 <- ggplot(loan_settled, aes(x = settle_days)) +
+  geom_histogram(bins = 60, alpha = 0.8) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Settlement timing (days relative to due date)",
+    y = "Number of loans"
+  ) +
+  theme(
+    axis.text  = element_text(color = "black"),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave("figure4_settlement_distribution.png", fig4,
+       width = 8, height = 5, dpi = 300)
+cat("Figure 4 saved: figure4_settlement_distribution.png\n")
+
+
+# 2.3 Linear regression models -----------------------------------
+cat("=== Fitting settlement timing models ===\n")
+
+model_settle_main <- lm(
+  settle_days ~ lti + pti + income_k + amount_k +
+    term_months + interest_rate + loan_sequence,
+  data = loan_settled
+)
+
+model_settle_interact <- lm(
+  settle_days ~ lti * term_months + pti + income_k +
+    amount_k + interest_rate + loan_sequence,
+  data = loan_settled
+)
+
+anova_result <- anova(model_settle_main, model_settle_interact)
+cat("Model comparison (settlement timing):\n")
+print(anova_result)
+
+p_value <- anova_result[2, "Pr(>F)"]
+
+if (is.na(p_value) || p_value >= 0.05) {
+  model_settle_final <- model_settle_main
+  cat("Selected model: main effects (p-value for interaction >= 0.05)\n")
+} else {
+  model_settle_final <- model_settle_interact
+  cat("Selected model: interaction (p-value < 0.05)\n")
+}
+
+
+# 2.4 Residual diagnostics data frame -----------------------------
+residual_df <- data.frame(
+  fitted    = fitted(model_settle_final),
+  resid     = residuals(model_settle_final),
+  std_resid = rstandard(model_settle_final)
+)
+
+
+# 2.5 Figure 5: Residual vs fitted -------------------------------
+fig5 <- ggplot(residual_df, aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_smooth(method = "loess", se = TRUE) +
+  labs(
+    x = "Fitted values (days)",
+    y = "Residuals (days)",
+    title = "Residual vs Fitted Plot"
+  ) +
+  theme(
+    axis.text  = element_text(color = "black"),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave("figure5_residual_plot.png", fig5,
+       width = 7, height = 5, dpi = 300)
+cat("Figure 5 saved: figure5_residual_plot.png\n")
+
+
+# 2.6 Figure 6: Normal Q–Q plot ---------------------------------
+fig6 <- ggplot(residual_df, aes(sample = std_resid)) +
+  stat_qq() +
+  stat_qq_line(linetype = "dashed") +
+  labs(
+    x = "Theoretical quantiles",
+    y = "Standardized residuals",
+    title = "Normal Q–Q Plot"
+  ) +
+  theme(
+    axis.text  = element_text(color = "black"),
+    axis.title = element_text(face = "bold")
+  )
+
+ggsave("figure6_qq_plot.png", fig6,
+       width = 6, height = 5, dpi = 300)
+cat("Figure 6 saved: figure6_qq_plot.png\n")
+
+
+# 2.7 Figure 7: Settlement timing by LTI quintile ---------------
+loan_settled <- loan_settled %>%
+  mutate(
+    lti_quintile = ntile(lti, 5),
+    lti_quintile_f = factor(
+      lti_quintile,
+      levels = 1:5,
+      labels = c("Q1", "Q2", "Q3", "Q4", "Q5")
+    )
+  )
+
+fig7 <- ggplot(loan_settled,
+               aes(x = lti_quintile_f, y = settle_days,
+                   fill = lti_quintile_f)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(
+    x = "Loan-to-Income Ratio Quintile",
+    y = "Settlement timing (days)",
+    title = "Settlement Timing by LTI Quintile"
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text       = element_text(color = "black"),
+    axis.title      = element_text(face = "bold")
+  )
+
+ggsave("figure7_settlement_by_lti.png", fig7,
+       width = 8, height = 5, dpi = 300)
+cat("Figure 7 saved: figure7_settlement_by_lti.png\n")
+
+cat("\nAll figures saved in working directory.\n")
+
+```
+
+```{r}
+# ===============================================================
+# AFFORDABILITY, DEFAULT, AND REPAYMENT TIMING IN CONSUMER LOANS
+# Complete Analysis Code
+# ===============================================================
+
+# 0. SETUP -------------------------------------------------------
+library(tidyverse)
+library(broom)
+library(car)          # VIF calculations
+library(pROC)         # ROC / AUC
+library(scales)       # Formatting percentages
+library(knitr)        # kable for tables
+library(gridExtra)    # Arrange multiple plots
+library(ggplot2)
+
+# Set consistent theme for all plots
+theme_set(theme_minimal(base_size = 11))
+
+# 1. READ AND PREPARE DATA ---------------------------------------
+loan <- read_csv("loan_preprocessed_for_R.csv")
+
+# Basic data preparation
+loan_clean <- loan %>%
+  mutate(
+    default_flag = as.integer(default_flag),
+    lti = loan_income_ratio,
+    pti = payment_ratio,
+    income_k = income / 1000,
+    amount_k = amount / 1000
+  ) %>%
+  drop_na(default_flag, lti, pti, income_k, amount_k, 
+          term_months, interest_rate, settle_days)
+
+cat("Total observations after cleaning:", nrow(loan_clean), "\n")
+cat("Default rate:", percent(mean(loan_clean$default_flag), accuracy = 0.1), "\n")
+
+# ===============================================================
+# RESEARCH QUESTION 1: DEFAULT ANALYSIS
+# ===============================================================
+
+cat("\n=== RESEARCH QUESTION 1: DEFAULT ANALYSIS ===\n")
+
+# 1.1 Create Balanced Sample -------------------------------------
+set.seed(12345)
+
+loan_default <- loan_clean %>% filter(default_flag == 1)
+loan_nondefault <- loan_clean %>% filter(default_flag == 0)
+n_default <- nrow(loan_default)
+
+loan_nondefault_sample <- loan_nondefault %>%
+  slice_sample(n = n_default)
+
+loan_balanced <- bind_rows(loan_default, loan_nondefault_sample) %>%
+  mutate(
+    lti_quintile = ntile(lti, 5),
+    lti_quintile_f = factor(
+      lti_quintile,
+      levels = 1:5,
+      labels = c("Q1 (Lowest)", "Q2", "Q3", "Q4", "Q5 (Highest)")
+    )
+  )
+
+cat("Balanced sample size:", nrow(loan_balanced), "\n")
+cat("Balanced default rate:", percent(mean(loan_balanced$default_flag)), "\n\n")
+
+# 1.2 Exploratory Data Analysis ----------------------------------
+
+# Default rate by LTI quintile
+default_by_lti <- loan_balanced %>%
+  group_by(lti_quintile_f) %>%
+  summarise(
+    n = n(),
+    defaults = sum(default_flag),
+    default_rate = mean(default_flag),
+    .groups = "drop"
+  )
+
+# Figure 1: Default rate by LTI quintile
+fig1 <- ggplot(default_by_lti, aes(x = lti_quintile_f, y = default_rate)) +
+  geom_col(fill = "#0072B2", alpha = 0.8, width = 0.7) +
+  geom_text(aes(label = percent(default_rate, accuracy = 0.1)), 
+            vjust = -0.5, size = 3.5, fontface = "bold") +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, max(default_by_lti$default_rate) * 1.15),
+                     expand = c(0, 0)) +
+  labs(
+    x = "Loan-to-Income Ratio Quintile",
+    y = "Default Rate"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(face = "bold")
+  )
+
+# Save Figure 1
+ggsave("figure1_default_by_lti.png", fig1, width = 6, height = 4, dpi = 300)
+
+# 1.3 Logistic Regression Models ---------------------------------
+
+# Model 1: Main effects only
+model_default_main <- glm(
+  default_flag ~ lti + income_k + amount_k + term_months + interest_rate,
+  data = loan_balanced,
+  family = binomial(link = "logit")
+)
+
+# Model 2: With interaction (REQUIRED)
+model_default_interact <- glm(
+  default_flag ~ lti * income_k + amount_k + term_months + interest_rate,
+  data = loan_balanced,
+  family = binomial(link = "logit")
+)
+
+# Compare models
+lr_test <- anova(model_default_main, model_default_interact, test = "Chisq")
+cat("\n=== MODEL COMPARISON ===\n")
+print(lr_test)
+
+# Choose final model
+model_default_final <- model_default_interact
+
+# 1.4 Model Summary Tables ---------------------------------------
+
+# Table 1: Logistic Regression Summary
+summary_table <- tidy(model_default_final, conf.int = TRUE) %>%
+  mutate(
+    term = case_when(
+      term == "(Intercept)" ~ "(Intercept)",
+      term == "lti" ~ "Loan-to-Income Ratio",
+      term == "income_k" ~ "Income (thousands USD)",
+      term == "amount_k" ~ "Loan Amount (thousands USD)",
+      term == "term_months" ~ "Loan Term (months)",
+      term == "interest_rate" ~ "Interest Rate (%)",
+      term == "lti:income_k" ~ "LTI × Income Interaction",
+      TRUE ~ term
+    ),
+    p.value_formatted = case_when(
+      p.value < 0.001 ~ "<.001",
+      TRUE ~ as.character(round(p.value, 3))
+    )
+  ) %>%
+  select(
+    Variable = term,
+    Estimate = estimate,
+    `Std Error` = std.error,
+    `z-value` = statistic,
+    `p-value` = p.value_formatted
+  )
+
+cat("\nTable 1: Logistic Regression Model Summary\n")
+print(kable(summary_table, digits = c(0, 3, 6, 3), format = "simple"))
+
+# 1.5 VIF Analysis -----------------------------------------------
+
+vif_values <- vif(model_default_final)
+
+vif_table <- data.frame(
+  Variable = names(vif_values),
+  VIF = as.numeric(vif_values)
+) %>%
+  arrange(desc(VIF))
+
+cat("\nTable 2: Variance Inflation Factors\n")
+print(kable(vif_table, digits = 3, format = "simple"))
+
+cat("\nVIF Summary:\n")
+cat("Maximum VIF:", round(max(vif_values), 3), "\n")
+cat("Mean VIF:", round(mean(vif_values), 3), "\n")
+
+# 1.6 ROC Curve and AUC ------------------------------------------
+
+roc_default <- roc(
+  response = loan_balanced$default_flag,
+  predictor = fitted(model_default_final),
+  direction = "<"
+)
+
+auc_value <- auc(roc_default)
+cat("\nArea Under ROC Curve (AUC):", round(auc_value, 4), "\n")
+
+# Figure 2: ROC Curve
+png("figure2_roc_curve.png", width = 6, height = 6, units = "in", res = 300)
+plot(roc_default, 
+     col = "#0072B2", 
+     lwd = 2,
+     main = "ROC Curve for Default Prediction Model",
+     print.auc = TRUE,
+     print.auc.x = 0.4,
+     print.auc.y = 0.1,
+     legacy.axes = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray50")
+dev.off()
+
+# 1.7 Confusion Matrix -------------------------------------------
+
+coords_roc <- coords(roc_default, "best", best.method = "youden")
+optimal_threshold <- coords_roc$threshold
+
+loan_balanced <- loan_balanced %>%
+  mutate(
+    pred_prob = fitted(model_default_final),
+    pred_class = ifelse(pred_prob > optimal_threshold, 1, 0)
+  )
+
+conf_matrix <- table(
+  Predicted = loan_balanced$pred_class,
+  Actual = loan_balanced$default_flag
+)
+
+cat("\nConfusion Matrix:\n")
+print(conf_matrix)
+
+# Performance metrics
+tn <- conf_matrix[1, 1]
+fp <- conf_matrix[2, 1]
+fn <- conf_matrix[1, 2]
+tp <- conf_matrix[2, 2]
+
+accuracy <- (tp + tn) / sum(conf_matrix)
+sensitivity <- tp / (tp + fn)
+specificity <- tn / (tn + fp)
+
+cat("\nModel Performance:\n")
+cat("Accuracy:", percent(accuracy, accuracy = 0.1), "\n")
+cat("Sensitivity:", percent(sensitivity, accuracy = 0.1), "\n")
+cat("Specificity:", percent(specificity, accuracy = 0.1), "\n")
+
+# 1.8 Predicted Probabilities (Interaction Effect) ---------------
+
+median_vals <- loan_balanced %>%
+  summarise(
+    amount_k = median(amount_k),
+    term_months = median(term_months),
+    interest_rate = median(interest_rate)
+  )
+
+newdata_lti <- expand_grid(
+  lti = seq(0.2, 2.5, length.out = 100),
+  income_k = c(30, 55, 100)  # Low, Median, High income
+) %>%
+  crossing(median_vals) %>%
+  mutate(
+    pred_prob = predict(model_default_final, newdata = ., type = "response"),
+    income_level = factor(
+      income_k,
+      levels = c(30, 55, 100),
+      labels = c("Low Income ($30k)", "Median Income ($55k)", "High Income ($100k)")
+    )
+  )
+
+# Figure 3: Interaction Effect
+fig3 <- ggplot(newdata_lti, aes(x = lti, y = pred_prob, color = income_level)) +
+  geom_line(size = 1.2) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  scale_x_continuous(breaks = seq(0, 2.5, 0.5)) +
+  scale_color_manual(values = c("#E69F00", "#0072B2", "#009E73")) +
+  labs(
+    x = "Loan-to-Income Ratio",
+    y = "Predicted Default Probability",
+    color = "Income Level"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(face = "bold"),
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# Save Figure 3
+ggsave("figure3_interaction_effect.png", fig3, width = 7, height = 5, dpi = 300)
+
+```
+
+You can add options to executable code like this
+
+```{r}
+# ===============================================================
+# RESEARCH QUESTION 2: SETTLEMENT TIMING ANALYSIS
+# ===============================================================
+
+cat("\n\n=== RESEARCH QUESTION 2: SETTLEMENT TIMING ===\n\n")
+
+# 2.1 Prepare Data -----------------------------------------------
+
+loan_settled <- loan_clean %>%
+  filter(default_flag == 0) %>%
+  filter(!is.na(settle_days) & !is.na(lti) & !is.na(pti) & 
+         !is.na(income_k) & !is.na(amount_k) & !is.na(term_months) & 
+         !is.na(interest_rate) & !is.na(loan_sequence))
+
+cat("Number of non-defaulted loans:", nrow(loan_settled), "\n")
+cat("Median settlement timing:", median(loan_settled$settle_days), "days\n")
+cat("Mean settlement timing:", round(mean(loan_settled$settle_days), 2), "days\n")
+cat("SD settlement timing:", round(sd(loan_settled$settle_days), 2), "days\n\n")
+
+# 2.2 Summary Statistics -----------------------------------------
+
+# Create settlement categories
+loan_settled$settle_category <- ifelse(loan_settled$settle_days < -7, "Early (>7 days)",
+                                ifelse(loan_settled$settle_days > 7, "Late (>7 days)", 
+                                       "On-time (±7 days)"))
+
+# Summary table
+settle_summary <- loan_settled %>%
+  group_by(settle_category) %>%
+  summarise(
+    n = n(),
+    pct = round(n() / nrow(loan_settled) * 100, 2),
+    mean_lti = round(mean(lti), 2),
+    mean_pti = round(mean(pti), 2),
+    mean_income = round(mean(income_k), 2)
+  )
+
+cat("\nTable 2: Settlement Timing Distribution\n")
+print(kable(settle_summary, format = "simple"))
+cat("\n")
+
+# 2.3 Figure 4: Distribution of Settlement Timing ---------------
+
+fig4 <- ggplot(loan_settled, aes(x = settle_days)) +
+  geom_histogram(bins = 60, fill = "#56B4E9", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red", size = 1) +
+  labs(
+    x = "Settlement Timing (days relative to due date)",
+    y = "Number of Loans"
+  ) +
+  theme_minimal()
+
+ggsave("figure4_settlement_distribution.png", fig4, width = 8, height = 5, dpi = 300)
+cat("Figure 4 saved successfully\n\n")
+
+# 2.4 Linear Regression Models -----------------------------------
+
+cat("=== Fitting Linear Regression Models ===\n\n")
+
+# Model 1: Main effects only
+model_settle_main <- lm(settle_days ~ lti + pti + income_k + amount_k + 
+                        term_months + interest_rate + loan_sequence,
+                        data = loan_settled)
+
+cat("Model 1 (Main Effects) fitted\n")
+
+# Model 2: With interaction
+model_settle_interact <- lm(settle_days ~ lti + term_months + lti:term_months + 
+                            pti + income_k + amount_k + interest_rate + loan_sequence,
+                            data = loan_settled)
+
+cat("Model 2 (With Interaction) fitted\n\n")
+
+# Compare models
+anova_result <- anova(model_settle_main, model_settle_interact)
+cat("Model Comparison (ANOVA):\n")
+print(anova_result)
+cat("\n")
+
+# Select final model - CORRECTED LINE
+p_value <- anova_result[2, "Pr(>F)"]
+
+if (is.na(p_value)) {
+  model_settle_final <- model_settle_main
+  cat("Main effects model selected (interaction p-value is NA)\n\n")
+} else if (p_value < 0.05) {
+  model_settle_final <- model_settle_interact
+  cat("Interaction model selected (p < 0.05)\n\n")
+} else {
+  model_settle_final <- model_settle_main
+  cat("Main effects model selected (p >= 0.05)\n\n")
+}
+
+# 2.5 Model Summary Table ----------------------------------------
+
+cat("=== Model Summary ===\n\n")
+
+# Get model summary
+model_summary <- summary(model_settle_final)
+print(model_summary)
+cat("\n")
+
+# Create tidy summary table
+coef_matrix <- coef(model_summary)
+summary_table <- data.frame(
+  Variable = rownames(coef_matrix),
+  Beta = coef_matrix[, "Estimate"],
+  SE = coef_matrix[, "Std. Error"],
+  t_value = coef_matrix[, "t value"],
+  p_value = coef_matrix[, "Pr(>|t|)"]
+)
+
+# Clean variable names
+summary_table$Variable <- gsub("\\(Intercept\\)", "(Intercept)", summary_table$Variable)
+summary_table$Variable <- gsub("^lti$", "Loan-to-Income Ratio", summary_table$Variable)
+summary_table$Variable <- gsub("^pti$", "Payment-to-Income Ratio", summary_table$Variable)
+summary_table$Variable <- gsub("income_k", "Income (thousands USD)", summary_table$Variable)
+summary_table$Variable <- gsub("amount_k", "Loan Amount (thousands USD)", summary_table$Variable)
+summary_table$Variable <- gsub("term_months", "Loan Term (months)", summary_table$Variable)
+summary_table$Variable <- gsub("interest_rate", "Interest Rate (%)", summary_table$Variable)
+summary_table$Variable <- gsub("loan_sequence", "Loan Sequence Number", summary_table$Variable)
+summary_table$Variable <- gsub("lti:term_months", "LTI × Term Interaction", summary_table$Variable)
+
+cat("\nTable 3: Settlement Timing Regression Model Summary\n")
+print(kable(summary_table, digits = 3, format = "simple", row.names = FALSE))
+cat("\n")
+
+# 2.6 Model Performance ------------------------------------------
+
+cat("=== Model Performance Metrics ===\n")
+cat("R-squared:", round(model_summary$r.squared, 4), "\n")
+cat("Adjusted R-squared:", round(model_summary$adj.r.squared, 4), "\n")
+cat("RMSE:", round(sqrt(mean(residuals(model_settle_final)^2)), 2), "days\n")
+cat("MAE:", round(mean(abs(residuals(model_settle_final))), 2), "days\n\n")
+
+# 2.7 VIF Analysis -----------------------------------------------
+
+cat("=== VIF Analysis ===\n\n")
+
+vif_result <- tryCatch({
+  vif(model_settle_final)
+}, error = function(e) {
+  cat("VIF calculation error:", e$message, "\n\n")
+  return(NULL)
+})
+
+if (!is.null(vif_result)) {
+  if (is.matrix(vif_result)) {
+    cat("Table 4: Generalized Variance Inflation Factors\n")
+    print(round(vif_result, 3))
+    cat("\n")
+  } else {
+    vif_table <- data.frame(
+      Variable = names(vif_result),
+      VIF = round(as.numeric(vif_result), 3)
+    )
+    vif_table <- vif_table[order(-vif_table$VIF), ]
+    
+    cat("Table 4: Variance Inflation Factors\n")
+    print(kable(vif_table, format = "simple", row.names = FALSE))
+    cat("\n")
+    cat("Maximum VIF:", round(max(vif_result), 3), "\n")
+    cat("Mean VIF:", round(mean(vif_result), 3), "\n\n")
+  }
+}
+
+# 2.8 Residual Diagnostics ---------------------------------------
+
+cat("=== Creating Residual Plots ===\n\n")
+
+# Figure 5: Residual vs Fitted
+residual_df <- data.frame(
+  fitted = fitted(model_settle_final),
+  resid = residuals(model_settle_final)
+)
+
+fig5 <- ggplot(residual_df, aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.3, color = "#0072B2") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", se = TRUE, color = "orange") +
+  labs(
+    x = "Fitted Values (days)",
+    y = "Residuals (days)",
+    title = "Residual vs Fitted Plot"
+  ) +
+  theme_minimal()
+
+ggsave("figure5_residual_plot.png", fig5, width = 7, height = 5, dpi = 300)
+cat("Figure 5 saved successfully\n")
+
+# Figure 6: Q-Q Plot
+residual_df$std_resid <- rstandard(model_settle_final)
+
+fig6 <- ggplot(residual_df, aes(sample = std_resid)) +
+  stat_qq(color = "#0072B2") +
+  stat_qq_line(color = "red", linetype = "dashed") +
+  labs(
+    x = "Theoretical Quantiles",
+    y = "Standardized Residuals",
+    title = "Normal Q-Q Plot"
+  ) +
+  theme_minimal()
+
+ggsave("figure6_qq_plot.png", fig6, width = 6, height = 5, dpi = 300)
+cat("Figure 6 saved successfully\n\n")
+
+# 2.9 Settlement by LTI Quintiles --------------------------------
+
+cat("=== Settlement Timing by LTI Quintiles ===\n\n")
+
+loan_settled$lti_quintile <- ntile(loan_settled$lti, 5)
+
+settle_by_lti <- loan_settled %>%
+  group_by(lti_quintile) %>%
+  summarise(
+    n = n(),
+    mean_settle = round(mean(settle_days), 2),
+    median_settle = round(median(settle_days), 2),
+    sd_settle = round(sd(settle_days), 2),
+    pct_late = round(mean(settle_days > 7) * 100, 2)
+  )
+
+settle_by_lti$Quintile <- paste0("Q", settle_by_lti$lti_quintile)
+settle_by_lti <- settle_by_lti[, c("Quintile", "n", "mean_settle", "median_settle", "sd_settle", "pct_late")]
+
+cat("Table 5: Settlement Timing by LTI Quintile\n")
+print(kable(settle_by_lti, format = "simple", row.names = FALSE,
+            col.names = c("LTI Quintile", "N", "Mean (days)", "Median (days)", "SD (days)", "% Late")))
+cat("\n")
+
+# Figure 7: Boxplot
+loan_settled$lti_quintile_f <- factor(loan_settled$lti_quintile,
+                                      levels = 1:5,
+                                      labels = c("Q1", "Q2", "Q3", "Q4", "Q5"))
+
+fig7 <- ggplot(loan_settled, aes(x = lti_quintile_f, y = settle_days, fill = lti_quintile_f)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  scale_fill_brewer(palette = "Blues") +
+  labs(
+    x = "Loan-to-Income Ratio Quintile",
+    y = "Settlement Timing (days)",
+    title = "Settlement Timing by LTI Quintile"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave("figure7_settlement_by_lti.png", fig7, width = 8, height = 5, dpi = 300)
+cat("Figure 7 saved successfully\n\n")
+
+cat("=== RESEARCH QUESTION 2 COMPLETE ===\n\n")
+
+
+```
+
+The `echo: false` option disables the printing of code (only output is displayed).
